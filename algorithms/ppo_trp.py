@@ -1,5 +1,5 @@
 """
-PPO + TRP Control (skeleton)
+PPO + TRP Control (prereg-accurate R_t)
 
 Implements prereg Conditions:
 1) baseline
@@ -12,8 +12,6 @@ Hooks in:
 - policy entropy + inverse progress -> P_t
 - dt_eff band controller
 - KL-leash trigger bursts
-
-This file is intentionally a runnable scaffold to be completed on laptop later.
 """
 
 from dataclasses import dataclass
@@ -40,48 +38,72 @@ class PPOConfig:
     batch_size: int = 2048
     update_epochs: int = 4
 
+    world_lr: float = 1e-3
+    world_epochs: int = 1
+
+
+class RunningEMA:
+    """Simple EMA for scalar signals (for inv-progress proxy)."""
+    def __init__(self, beta=0.01):
+        self.beta = beta
+        self.val = 0.0
+        self.init = False
+
+    def update(self, x):
+        x = float(x)
+        if not self.init:
+            self.val = x
+            self.init = True
+        else:
+            self.val = (1 - self.beta) * self.val + self.beta * x
+        return self.val
+
 
 class ActorCritic(nn.Module):
-    """Tiny generic AC net; swap with CNN/GRU trunks later."""
+    """
+    Tiny generic AC net with explicit embedding e_t.
+    e_t is the output of emb_net before pi/v heads.
+    """
     def __init__(self, obs_dim, act_dim, hidden=128):
         super().__init__()
-        self.pi = nn.Sequential(
+        self.hidden = hidden
+
+        self.emb_net = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, act_dim)
+            nn.Linear(hidden, hidden), nn.Tanh()
         )
-        self.v  = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.Tanh(),
-            nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 1)
-        )
+        self.pi_head = nn.Linear(hidden, act_dim)
+        self.v_head  = nn.Linear(hidden, 1)
+
+    def embed(self, obs):
+        return self.emb_net(obs)
 
     def forward(self, obs):
-        logits = self.pi(obs)
-        value  = self.v(obs).squeeze(-1)
-        return logits, value
+        emb = self.embed(obs)
+        logits = self.pi_head(emb)
+        value  = self.v_head(emb).squeeze(-1)
+        return logits, value, emb
 
     def act(self, obs):
-        logits, value = self.forward(obs)
+        logits, value, emb = self.forward(obs)
         dist = Categorical(logits=logits)
         action = dist.sample()
         logp = dist.log_prob(action)
         entropy = dist.entropy()
-        return action, logp, entropy, value
+        return action, logp, entropy, value, emb
 
 
 class WorldModel(nn.Module):
-    """Online predictor for embedding_{t+1}. Placeholder MLP."""
+    """Online predictor for e_{t+1} from (e_t, a_t)."""
     def __init__(self, emb_dim, act_dim, hidden=128):
         super().__init__()
+        self.act_dim = act_dim
         self.net = nn.Sequential(
             nn.Linear(emb_dim + act_dim, hidden), nn.ReLU(),
             nn.Linear(hidden, emb_dim)
         )
-        self.act_dim = act_dim
 
     def forward(self, emb_t, a_t):
-        # one-hot action for now
         a_onehot = torch.nn.functional.one_hot(a_t, self.act_dim).float()
         x = torch.cat([emb_t, a_onehot], dim=-1)
         return self.net(x)
@@ -116,7 +138,7 @@ class PPO_TRP_Trainer:
         self.condition = condition
         self.control_interval = control_interval
 
-        self.model = ActorCritic(obs_dim, act_dim)
+        self.model = ActorCritic(obs_dim, act_dim, hidden=128)
         self.opt = torch.optim.Adam(self.model.parameters(), lr=cfg.lr)
 
         # TRP trackers
@@ -126,12 +148,17 @@ class PPO_TRP_Trainer:
 
         self.leash = KLLeash(kappa=kappa) if kappa is not None else None
 
-        # World model placeholder for R_t
-        self.world = WorldModel(emb_dim=obs_dim, act_dim=act_dim)
-        self.world_opt = torch.optim.Adam(self.world.parameters(), lr=1e-3)
+        # World model for R_t
+        emb_dim = self.model.hidden
+        self.world = WorldModel(emb_dim=emb_dim, act_dim=act_dim, hidden=128)
+        self.world_opt = torch.optim.Adam(self.world.parameters(), lr=cfg.world_lr)
 
         # dynamic entropy coefficient (for TRP/adaptive_entropy conditions)
         self.ent_coef = cfg.ent_coef
+
+        # inverse-progress proxy EMA
+        self.prev_v_loss = None
+        self.inv_prog_ema = RunningEMA(beta=0.01)
 
         # logs
         self.logs = {
@@ -141,6 +168,7 @@ class PPO_TRP_Trainer:
             "P_t": [],
             "KL": [],
             "leash_fires": 0,
+            "world_eps": [],
         }
 
     def _maybe_trp_control(self, step_i):
@@ -153,13 +181,10 @@ class PPO_TRP_Trainer:
 
         dt = self.trp.dt_eff
         if dt < self.ell:
-            # increase exploration/novelty
             self.ent_coef = min(self.ent_coef * 1.15, self.cfg.ent_coef * 2.0)
-            # env difficulty knob will be implemented in env wrapper later
             if hasattr(self.env, "harder"):
                 self.env.harder()
         elif dt > self.u:
-            # reduce overload
             self.ent_coef = max(self.ent_coef * 0.90, self.cfg.ent_coef * 0.5)
             if hasattr(self.env, "easier"):
                 self.env.easier()
@@ -169,13 +194,21 @@ class PPO_TRP_Trainer:
         ep_ret = 0.0
 
         obses, acts, logps, ents, vals, rews, dones = [], [], [], [], [], [], []
+        embes, next_embes = [], []
 
         for t in range(self.cfg.rollout_len):
             obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-            action, logp, entropy, value = self.model.act(obs_t)
+
+            with torch.no_grad():
+                action, logp, entropy, value, emb_t = self.model.act(obs_t)
 
             next_obs, reward, terminated, truncated, _ = self.env.step(action.item())
             done = terminated or truncated
+
+            # compute next embedding e_{t+1} with frozen trunk
+            next_obs_t = torch.tensor(next_obs, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                _, _, next_emb_t = self.model.forward(next_obs_t)
 
             obses.append(obs)
             acts.append(action.item())
@@ -184,6 +217,9 @@ class PPO_TRP_Trainer:
             vals.append(value.item())
             rews.append(reward)
             dones.append(done)
+
+            embes.append(emb_t.squeeze(0).cpu().numpy())
+            next_embes.append(next_emb_t.squeeze(0).cpu().numpy())
 
             ep_ret += reward
             obs = next_obs
@@ -201,9 +237,11 @@ class PPO_TRP_Trainer:
             np.array(vals),
             np.array(rews),
             np.array(dones),
+            np.array(embes),
+            np.array(next_embes),
         )
 
-    def update(self, obses, acts, old_logps, ents, vals, rews, dones):
+    def update(self, obses, acts, old_logps, ents, vals, rews, dones, embes, next_embes):
         adv, rets = compute_gae(rews, vals, dones, self.cfg.gamma, self.cfg.lam)
 
         obses_t = torch.tensor(obses, dtype=torch.float32)
@@ -212,11 +250,10 @@ class PPO_TRP_Trainer:
         adv_t = torch.tensor(adv, dtype=torch.float32)
         rets_t = torch.tensor(rets, dtype=torch.float32)
 
-        # inverse progress proxy (placeholder: use value loss delta later)
-        inv_progress = float(np.mean(adv))
-
+        # --- PPO update ---
+        last_v_loss = None
         for _ in range(self.cfg.update_epochs):
-            logits, value = self.model(obses_t)
+            logits, value, _ = self.model(obses_t)
             dist = Categorical(logits=logits)
             logp = dist.log_prob(acts_t)
             entropy = dist.entropy().mean()
@@ -227,6 +264,7 @@ class PPO_TRP_Trainer:
             pi_loss = -(torch.min(surr1, surr2)).mean()
 
             v_loss = ((value - rets_t) ** 2).mean()
+            last_v_loss = v_loss.item()
 
             loss = pi_loss + self.cfg.vf_coef * v_loss - self.ent_coef * entropy
 
@@ -235,29 +273,49 @@ class PPO_TRP_Trainer:
             nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.max_grad_norm)
             self.opt.step()
 
+        # inv-progress proxy: EMA of value-loss improvement
+        if self.prev_v_loss is None:
+            inv_progress = 0.0
+        else:
+            inv_progress = self.prev_v_loss - last_v_loss
+        self.prev_v_loss = last_v_loss
+        inv_progress = self.inv_prog_ema.update(inv_progress)
+
+        # --- World model update for R_t ---
+        emb_t = torch.tensor(embes, dtype=torch.float32)
+        next_emb_t = torch.tensor(next_embes, dtype=torch.float32)
+
+        # train world model a little each update
+        for _ in range(self.cfg.world_epochs):
+            pred_next = self.world(emb_t, acts_t)
+            eps_per = ((next_emb_t - pred_next) ** 2).mean(dim=-1)  # per-step ε_t
+            world_loss = eps_per.mean()
+
+            self.world_opt.zero_grad()
+            world_loss.backward()
+            self.world_opt.step()
+
+        eps_t_scalar = float(eps_per.mean().item())  # mean ε_t across rollout
+        self.logs["world_eps"].append(eps_t_scalar)
+
         # --- TRP updates ---
-        # P_t from entropy + inv_progress
         P_t = self.trp.update_P(entropy.item(), inv_progress)
-
-        # R_t from world-model prediction error (placeholder)
-        # Here using obs_{t+1} prediction not implemented yet; stub with entropy
-        eps_t = float(entropy.item() ** 2)
-        R_t = self.trp.update_R(eps_t)
-
+        R_t = self.trp.update_R(eps_t_scalar)
         dt = self.trp.update_dt()
 
         self.logs["P_t"].append(P_t)
         self.logs["R_t"].append(R_t)
         self.logs["dt_eff"].append(dt)
 
-        return entropy.item(), v_loss.item()
+        return entropy.item(), last_v_loss
 
     def train(self, total_steps):
         step_i = 0
         last_logps_t = None
 
         while step_i < total_steps:
-            obses, acts, logps, ents, vals, rews, dones = self.rollout()
+            (obses, acts, logps, ents, vals, rews, dones,
+             embes, next_embes) = self.rollout()
 
             # KL leash check (conditions 3 & 4)
             if self.condition in ("kl_only", "trp_full") and self.leash is not None:
@@ -267,11 +325,10 @@ class PPO_TRP_Trainer:
                     self.logs["KL"].append(kl)
                     if triggered:
                         self.logs["leash_fires"] += 1
-                        # one-update exploration burst
                         self.ent_coef = min(self.ent_coef * 1.5, self.cfg.ent_coef * 2.0)
                 last_logps_t = logps_t.clone()
 
-            self.update(obses, acts, logps, ents, vals, rews, dones)
+            self.update(obses, acts, logps, ents, vals, rews, dones, embes, next_embes)
 
             step_i += self.cfg.rollout_len
 
