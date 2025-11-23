@@ -1,0 +1,15 @@
+{
+  "locked_on": "2025-11-23",
+  "env_family": null,
+  "baseline_ent_coef": null,
+  "dt_band": {
+    "ell": null,
+    "u": null,
+    "quantiles": [0.35, 0.65]
+  },
+  "kl_leash": {
+    "kappa": null,
+    "quantile": 0.95
+  },
+  "notes": "This file will be overwritten by scripts/pilot.py after running the pilot. Until then, values remain null."
+}
