@@ -1,0 +1,11 @@
+numpy
+scipy
+torch
+gymnasium
+minigrid
+procgen
+tqdm
+pyyaml
+matplotlib
+pandas
+wandb
