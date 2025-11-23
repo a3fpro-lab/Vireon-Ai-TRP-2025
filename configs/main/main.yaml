@@ -1,0 +1,24 @@
+env_families:
+  - minigrid
+  - procgen
+
+conditions:
+  - baseline
+  - adaptive_entropy
+  - kl_only
+  - trp_full
+
+steps:
+  minigrid: 2000000
+  procgen: 10000000
+
+trp:
+  control_interval: 2048
+  kappa_from_pilot: true
+  band_from_pilot: true
+
+logging:
+  use_wandb: true
+  project: trp-2025-main
+
+save_dir: results
